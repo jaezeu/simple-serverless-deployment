@@ -1,45 +1,23 @@
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 4.0.0"
-    }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.1.0"
-    }
-    archive = {
-      source  = "hashicorp/archive"
-      version = "~> 2.2.0"
-    }
-  }
-
-  required_version = ">= 0.14.9"
-}
-
-provider "aws" {
-  profile = "default"
-  region = var.aws_region
+locals {
+  name_prefix = "jaz"
 }
 
 resource "random_string" "random" {
-  length           = 4
-  special          = false
+  length  = 4
+  special = false
 }
 
-resource "aws_dynamodb_table" "movie_table" {
-  name           = var.dynamodb_table
-  billing_mode   = "PROVISIONED"
-  read_capacity  = 20
-  write_capacity = 20
-  hash_key       = "year"
-  range_key      = "title"
+resource "aws_dynamodb_table" "table" {
+  name         = "${local.name_prefix}-serverlessddb-${random_string.random.id}"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "year"
+  range_key    = "title"
 
   attribute {
     name = "year"
     type = "N"
   }
-  
+
   attribute {
     name = "title"
     type = "S"
@@ -56,11 +34,6 @@ resource "aws_s3_bucket" "lambda_bucket" {
   force_destroy = true
 }
 
-resource "aws_s3_bucket_acl" "private_bucket" {
-  bucket = aws_s3_bucket.lambda_bucket.id
-  acl    = "private"
-}
-
 data "archive_file" "lambda_zip" {
   type = "zip"
 
@@ -68,47 +41,25 @@ data "archive_file" "lambda_zip" {
   output_path = "${path.module}/src.zip"
 }
 
-resource "aws_s3_object" "this" {
-  bucket = aws_s3_bucket.lambda_bucket.id
-
-  key    = "src.zip"
-  source = data.archive_file.lambda_zip.output_path
-
-  etag = filemd5(data.archive_file.lambda_zip.output_path)
-}
-
 //Define lambda function
-resource "aws_lambda_function" "apigw_lambda_ddb" {
-  function_name = "${var.lambda_name}-${random_string.random.id}"
-  description = "serverlessland pattern"
-
-  s3_bucket = aws_s3_bucket.lambda_bucket.id
-  s3_key    = aws_s3_object.this.key
-
-  runtime = "python3.8"
-  handler = "app.lambda_handler"
-
+resource "aws_lambda_function" "http_api_lambda" {
+  filename         = data.archive_file.lambda_zip.output_path
+  function_name    = "${local.name_prefix}-serverlesslambda-${random_string.random.id}"
+  description      = "Lambda function to write to dynamodb"
+  runtime          = "python3.8"
+  handler          = "app.lambda_handler"
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  role             = aws_iam_role.lambda_exec.arn
 
-  role = aws_iam_role.lambda_exec.arn
-  
   environment {
     variables = {
-      DDB_TABLE = var.dynamodb_table
+      DDB_TABLE = aws_dynamodb_table.table.name
     }
   }
-  depends_on = [aws_cloudwatch_log_group.lambda_logs]
-  
-}
-
-resource "aws_cloudwatch_log_group" "lambda_logs" {
-  name = "/aws/lambda/${var.lambda_name}-${random_string.random.id}"
-
-  retention_in_days = var.lambda_log_retention
 }
 
 resource "aws_iam_role" "lambda_exec" {
-  name = "LambdaDdbPost"
+  name = "${local.name_prefix}-LambdaDdbPostRole-${random_string.random.id}"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -125,7 +76,7 @@ resource "aws_iam_role" "lambda_exec" {
 }
 
 resource "aws_iam_policy" "lambda_exec_role" {
-  name = "lambda-tf-pattern-ddb-post"
+  name = "${local.name_prefix}-LambdaDdbPostPolicy-${random_string.random.id}"
 
   policy = <<POLICY
 {
@@ -138,7 +89,7 @@ resource "aws_iam_policy" "lambda_exec_role" {
                 "dynamodb:PutItem",
                 "dynamodb:UpdateItem"
             ],
-            "Resource": "arn:aws:dynamodb:*:*:table/${var.dynamodb_table}"
+            "Resource": "arn:aws:dynamodb:*:*:table/${aws_dynamodb_table.table.name}"
         },
         {
             "Effect": "Allow",
@@ -163,19 +114,19 @@ resource "aws_iam_role_policy_attachment" "lambda_policy" {
 // API Gateway section
 #========================================================================
 
-resource "aws_apigatewayv2_api" "http_lambda" {
-  name          = "${var.apigw_name}-${random_string.random.id}"
+resource "aws_apigatewayv2_api" "http_api" {
+  name          = "${local.name_prefix}-http-api-${random_string.random.id}"
   protocol_type = "HTTP"
 }
 
 resource "aws_apigatewayv2_stage" "default" {
-  api_id = aws_apigatewayv2_api.http_lambda.id
+  api_id = aws_apigatewayv2_api.http_api.id
 
   name        = "$default"
   auto_deploy = true
 
   access_log_settings {
-    destination_arn = aws_cloudwatch_log_group.api_gw.arn
+    destination_arn = aws_cloudwatch_log_group.api_access_logs.arn
 
     format = jsonencode({
       requestId               = "$context.requestId"
@@ -191,35 +142,35 @@ resource "aws_apigatewayv2_stage" "default" {
       }
     )
   }
-  depends_on = [aws_cloudwatch_log_group.api_gw]
+  depends_on = [aws_cloudwatch_log_group.api_access_logs]
 }
 
 resource "aws_apigatewayv2_integration" "apigw_lambda" {
-  api_id = aws_apigatewayv2_api.http_lambda.id
+  api_id = aws_apigatewayv2_api.http_api.id
 
-  integration_uri    = aws_lambda_function.apigw_lambda_ddb.invoke_arn
+  integration_uri    = aws_lambda_function.http_api_lambda.invoke_arn
   integration_type   = "AWS_PROXY"
   integration_method = "POST"
 }
 
 resource "aws_apigatewayv2_route" "post" {
-  api_id = aws_apigatewayv2_api.http_lambda.id
+  api_id = aws_apigatewayv2_api.http_api.id
 
   route_key = "POST /movies"
   target    = "integrations/${aws_apigatewayv2_integration.apigw_lambda.id}"
 }
 
-resource "aws_cloudwatch_log_group" "api_gw" {
-  name = "/aws/api_gw/${var.apigw_name}-${random_string.random.id}"
+resource "aws_cloudwatch_log_group" "api_access_logs" {
+  name = "/aws/api_gw/${aws_apigatewayv2_api.http_api.name}"
 
-  retention_in_days = var.apigw_log_retention
+  retention_in_days = 7
 }
 
 resource "aws_lambda_permission" "api_gw" {
   statement_id  = "AllowExecutionFromAPIGateway"
   action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.apigw_lambda_ddb.function_name
+  function_name = aws_lambda_function.http_api_lambda.function_name
   principal     = "apigateway.amazonaws.com"
 
-  source_arn = "${aws_apigatewayv2_api.http_lambda.execution_arn}/*/*"
+  source_arn = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*"
 }
